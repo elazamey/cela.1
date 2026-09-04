@@ -158,3 +158,85 @@ class AIResolver:
 """
         logger.info("توليد اقتراح حل للمشكلة: %s", issue_title)
         return self._generate(prompt)
+
+    # ------------------------------------------------------------------ #
+    # CI failure diagnosis (used by ci_healer)
+    # ------------------------------------------------------------------ #
+    def diagnose_ci_failure(
+        self,
+        repo_name: str,
+        workflow_path: str,
+        workflow_content: str,
+        run_name: str,
+        head_sha: str,
+        failure_family: str,
+        failure_excerpt: str,
+    ) -> str:
+        """تشخيص فشل CI عبر Gemini وإرجاع الرد الكامل (markdown + yaml مصحح)."""
+        prompt = self.build_ci_diagnosis_prompt(
+            repo_name=repo_name,
+            workflow_path=workflow_path,
+            workflow_content=workflow_content,
+            run_name=run_name,
+            head_sha=head_sha,
+            failure_family=failure_family,
+            failure_excerpt=failure_excerpt,
+        )
+        logger.info("تشخيص فشل CI في %s (%s)", repo_name, workflow_path)
+        return self._generate(prompt)
+
+    @staticmethod
+    def build_ci_diagnosis_prompt(
+        repo_name: str,
+        workflow_path: str,
+        workflow_content: str,
+        run_name: str,
+        head_sha: str,
+        failure_family: str,
+        failure_excerpt: str,
+    ) -> str:
+        """بناء prompt تشخيص فشل CI (منفصل كي يُختبر بدون شبكة)."""
+        return f"""
+أنت مهندس DevOps خبير في GitHub Actions. تشخّص فشل pipeline وتعطي ملف
+workflow YAML مصححاً جاهزاً للالتزام.
+
+المستودع: {repo_name}
+الملف: {workflow_path}
+التشغيل الفاشل: {run_name} (commit {head_sha or '?'})
+عائلة الفشل المبدئية: {failure_family}
+
+محتوى workflow الحالي:
+```yaml
+{workflow_content or "(الملف غير موجود في الفرع الافتراضي)"}
+```
+
+مقتطف من سجل الفشل:
+```text
+{failure_excerpt or "(لا يوجد مقتطف)"}
+```
+
+المطلوب:
+1. شخّص السبب الجذري في 3-5 أسطر (عربي أو إنجليزي).
+2. أعد إنتاج ملف الـ workflow كاملاً ومصححاً داخل كتلة markdown واحدة بصيغة
+   ```yaml ... ``` مع الحفاظ على اسمه وبنيته قدر الإمكان، مع تصحيح الخطأ فقط
+   (مثال: نسخة python/node قديمة، خطأ syntax، أمر خاطئ، مفقود، صلاحية ناقصة).
+3. لا تستخدم أي كتلة markdown أخرى، ولا تضع شرحاً داخل كتلة yaml نفسها.
+4. إذا لم تكن معلومات السجل كافية، أعد نفس الـ workflow بدون تغيير واشرح
+   المعلومات الناقصة خارج الكتلة.
+"""
+
+    @staticmethod
+    def extract_fenced_yaml(text: str) -> Optional[str]:
+        """استخراج محتوى أول كتلة yaml/yml مسوّرة داخل رد النموذج.
+
+        Returns:
+            نص YAML الداخلي، أو None إن لم يوجد أي كتلة YAML مسوّرة.
+        """
+        if not text:
+            return None
+        match = re.search(
+            r"```(?:ya?ml)[ \t]*\r?\n(.*?)\r?\n?```",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        return match.group(1).strip() if match else None
