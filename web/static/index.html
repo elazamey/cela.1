@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Celia Repo Agent — لوحة التحكم</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { colors: { brand: { 500: "#6366f1", 600: "#4f46e5" } } } } };
+  </script>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, system-ui, sans-serif; }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 8px; }
+    .pill { display: inline-flex; align-items: center; gap: 0.25rem; border-radius: 9999px; padding: 0.125rem 0.625rem; font-size: 0.75rem; font-weight: 500; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <div class="max-w-6xl mx-auto px-4 py-6">
+    <!-- Header -->
+    <header class="flex flex-wrap items-center justify-between gap-3 mb-6">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-xl bg-brand-600 flex items-center justify-center text-xl shadow-lg shadow-brand-600/30">🤖</div>
+        <div>
+          <h1 class="text-xl font-bold">Celia Repo Agent</h1>
+          <p class="text-sm text-slate-400">لوحة مراقبة الفحص اليومي والأمان و CI</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <span id="connBadge" class="pill bg-slate-800 text-slate-300">⚪ غير متصل</span>
+        <span id="demoBadge" class="pill bg-amber-900/40 text-amber-300 hidden">DEMO</span>
+        <button onclick="refreshAll()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-sm transition">🔄 تحديث</button>
+        <button onclick="demoActivity()" class="px-3 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-sm transition">⚡ محاكاة نشاط حي</button>
+      </div>
+    </header>
+
+    <!-- KPI cards -->
+    <section class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6" id="kpis">
+      <div class="rounded-xl bg-slate-900 border border-slate-800 p-4"><div class="text-slate-400 text-xs mb-1">إجمالي التشغيلات</div><div id="kpiTotal" class="text-2xl font-bold">–</div></div>
+      <div class="rounded-xl bg-slate-900 border border-slate-800 p-4"><div class="text-slate-400 text-xs mb-1">PRs مفتوحة تلقائياً</div><div id="kpiPrs" class="text-2xl font-bold text-emerald-400">–</div></div>
+      <div class="rounded-xl bg-slate-900 border border-slate-800 p-4"><div class="text-slate-400 text-xs mb-1">تعليقات الحلول</div><div id="kpiComments" class="text-2xl font-bold text-sky-400">–</div></div>
+      <div class="rounded-xl bg-slate-900 border border-slate-800 p-4"><div class="text-slate-400 text-xs mb-1">أخطاء</div><div id="kpiErrors" class="text-2xl font-bold text-rose-400">–</div></div>
+      <div class="rounded-xl bg-slate-900 border border-slate-800 p-4"><div class="text-slate-400 text-xs mb-1">آخر حدث</div><div id="kpiLast" class="text-sm font-bold text-slate-200 leading-6 mt-1">–</div></div>
+    </section>
+
+    <!-- Runs + events -->
+    <section class="grid lg:grid-cols-5 gap-4">
+      <!-- Runs table -->
+      <div class="lg:col-span-2 rounded-xl bg-slate-900 border border-slate-800 overflow-hidden">
+        <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+          <h2 class="font-semibold text-sm">التشغيلات الأخيرة</h2>
+          <span class="text-xs text-slate-500" id="runCount"></span>
+        </div>
+        <div class="max-h-[520px] overflow-y-auto" id="runsList"></div>
+      </div>
+
+      <!-- Events -->
+      <div class="lg:col-span-3 rounded-xl bg-slate-900 border border-slate-800 overflow-hidden flex flex-col">
+        <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between gap-2">
+          <h2 class="font-semibold text-sm">سجل الأحداث الحي <span id="liveDot" class="inline-block w-2 h-2 rounded-full bg-slate-600 align-middle"></span></h2>
+          <select id="levelFilter" onchange="renderEvents()" class="bg-slate-800 text-xs rounded-lg px-2 py-1 border border-slate-700">
+            <option value="all">كل المستويات</option>
+            <option value="info">info</option>
+            <option value="warning">warning</option>
+            <option value="success">success</option>
+            <option value="error">error</option>
+          </select>
+        </div>
+        <div class="flex-1 overflow-y-auto max-h-[520px] p-3 space-y-1.5 font-mono text-[13px]" id="eventsList"></div>
+      </div>
+    </section>
+
+    <footer class="mt-6 text-center text-xs text-slate-600">
+      Celia Repo Agent · Node.js security · CI healing · مراقبة حية عبر WebSocket
+    </footer>
+  </div>
+
+<script>
+const API = "/api";
+let TOKEN = localStorage.getItem("celia_token") || "";
+let RUNS = [];
+let EVENTS = [];
+let CURRENT_RUN = null;
+let LATEST_EVENT_ID = 0;
+let WS = null;
+const LEVEL_STYLE = {
+  info:    "text-slate-300",
+  warning: "text-amber-300",
+  success: "text-emerald-300",
+  error:   "text-rose-400 font-semibold"
+};
+
+async function api(path, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
+  const resp = await fetch(API + path, { ...options, headers });
+  if (resp.status === 401) { localStorage.removeItem("celia_token"); TOKEN = ""; }
+  if (!resp.ok) throw new Error(path + " -> " + resp.status);
+  return resp.json();
+}
+
+async function ensureToken() {
+  if (TOKEN) return true;
+  try {
+    const data = await api("/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: localStorage.getItem("celia_dash_token") || "demo" })
+    });
+    TOKEN = data.access_token;
+    localStorage.setItem("celia_token", TOKEN);
+    if (data.demo_mode) { document.getElementById("demoBadge").classList.remove("hidden"); }
+    return true;
+  } catch (e) {
+    document.getElementById("connBadge").innerHTML = "🔒 توكن غير صحيح";
+    document.getElementById("demoBadge").classList.remove("hidden");
+    return false;
+  }
+}
+
+function setBadge(text, ok) {
+  const el = document.getElementById("connBadge");
+  el.textContent = text;
+  el.className = "pill " + (ok ? "bg-emerald-900/40 text-emerald-300" : "bg-rose-900/40 text-rose-300");
+}
+
+function connectWS() {
+  if (WS) WS.close();
+  WS = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/events?token=" + encodeURIComponent(TOKEN));
+  WS.onopen = () => { setBadge("● متصل مباشر", true); document.getElementById("liveDot").className = "inline-block w-2 h-2 rounded-full bg-emerald-400 align-middle"; };
+  WS.onclose = () => { setBadge("⚪ إعادة الاتصال...", false); document.getElementById("liveDot").className = "inline-block w-2 h-2 rounded-full bg-rose-500 align-middle"; setTimeout(connectWS, 4000); };
+  WS.onmessage = (msg) => {
+    try {
+      const data = JSON.parse(msg.data);
+      if (data.type === "event" && data.event) {
+        EVENTS.push(data.event);
+        if (!CURRENT_RUN || data.event.run_id === CURRENT_RUN) renderEvents();
+        renderKpis();
+      }
+    } catch (e) { /* تجاهل */ }
+  };
+}
+
+function renderKpis() {
+  const latest = RUNS[0];
+  document.getElementById("kpiTotal").textContent = RUNS.length;
+  document.getElementById("kpiPrs").textContent = RUNS.reduce((a, r) => a + (r.prs_created || 0), 0);
+  document.getElementById("kpiComments").textContent = RUNS.reduce((a, r) => a + (r.comments_posted || 0), 0);
+  document.getElementById("kpiErrors").textContent = RUNS.reduce((a, r) => a + (r.errors || 0), 0);
+  const lastEvent = EVENTS[EVENTS.length - 1];
+  document.getElementById("kpiLast").textContent = lastEvent ? lastEvent.message.slice(0, 42) : "—";
+}
+
+function renderRuns() {
+  const el = document.getElementById("runsList");
+  document.getElementById("runCount").textContent = RUNS.length + " تشغيل";
+  el.innerHTML = RUNS.map(r => {
+    const active = CURRENT_RUN === r.id;
+    const statusColor = r.status === "running" ? "bg-sky-500" : (r.errors > 0 ? "bg-rose-500" : "bg-emerald-500");
+    return `<button onclick="selectRun(${r.id})" class="w-full text-right px-4 py-3 hover:bg-slate-800/60 transition border-b border-slate-800/60 ${active ? "bg-slate-800/60 border-r-4 border-r-brand-500" : ""}">
+      <div class="flex items-center justify-between gap-2">
+        <span class="font-semibold text-sm">تشغيل #${r.id}</span>
+        <span class="flex items-center gap-1.5 text-xs text-slate-400"><span class="w-2 h-2 rounded-full ${statusColor}"></span>${r.status}</span>
+      </div>
+      <div class="text-xs text-slate-500 mt-1">${r.started_at || ""} · وضع: ${r.mode || "auto"}</div>
+      <div class="flex flex-wrap gap-2 mt-2 text-xs">
+        <span class="pill bg-slate-800 text-slate-300">📦 ${r.repos_scanned || 0} مستودع</span>
+        <span class="pill bg-emerald-900/30 text-emerald-300">🔀 ${r.prs_created || 0} PR</span>
+        <span class="pill bg-sky-900/30 text-sky-300">💬 ${r.comments_posted || 0}</span>
+        <span class="pill bg-rose-900/30 text-rose-300">✖ ${r.errors || 0}</span>
+      </div>
+    </button>`;
+  }).join("") || '<div class="p-6 text-center text-slate-500 text-sm">لا توجد تشغيلات بعد</div>';
+}
+
+function selectRun(id) {
+  CURRENT_RUN = id;
+  EVENTS = [];
+  LATEST_EVENT_ID = 0;
+  renderRuns();
+  loadEvents();
+}
+
+function renderEvents() {
+  const filter = document.getElementById("levelFilter").value;
+  const el = document.getElementById("eventsList");
+  const list = (filter === "all" ? EVENTS : EVENTS.filter(e => e.level === filter)).slice(-400);
+  el.innerHTML = list.map(e => `
+    <div class="flex items-start gap-2">
+      <span class="text-slate-600 shrink-0" title="${e.ts}">${(e.ts || "").slice(11, 19)}</span>
+      <span class="shrink-0 w-16 text-left text-xs ${LEVEL_STYLE[e.level] || "text-slate-300"}">[${e.level}]</span>
+      <span class="${LEVEL_STYLE[e.level] || "text-slate-300"} break-all">${escapeHtml(e.message)}</span>
+    </div>`).join("") || '<div class="p-6 text-center text-slate-500 text-sm">لا توجد أحداث مطابقة</div>';
+  el.scrollTop = el.scrollHeight;
+}
+
+function escapeHtml(s) {
+  const d = document.createElement("span");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+async function refreshAll() {
+  if (!await ensureToken()) return;
+  try {
+    const runsData = await api("/runs?limit=25");
+    RUNS = runsData.runs;
+    renderRuns();
+    renderKpis();
+    if (!CURRENT_RUN && RUNS.length) CURRENT_RUN = RUNS[0].id;
+    await loadEvents();
+    if (!WS || WS.readyState > 1) connectWS();
+  } catch (e) {
+    setBadge("✖ تعذّر الاتصال", false);
+  }
+}
+
+async function loadEvents() {
+  try {
+    let path = "/events?after_id=" + LATEST_EVENT_ID + "&limit=800";
+    if (CURRENT_RUN) path += "&run_id=" + CURRENT_RUN;
+    const data = await api(path);
+    if (data.events.length) { EVENTS.push(...data.events); LATEST_EVENT_ID = data.events[data.events.length - 1].id; }
+    renderEvents();
+    renderKpis();
+  } catch (e) { /* يظهر عند التحديث القادم */ }
+}
+
+async function demoActivity() {
+  if (!await ensureToken()) return;
+  try {
+    await api("/demo/activity", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ events: 14 }) });
+    setTimeout(refreshAll, 1500);
+  } catch (e) { /* تجاهل */ }
+}
+
+refreshAll();
+setInterval(loadEvents, 4000);      // Poll: يلتقط أحداث الوكيل الخارجي (عملية منفصلة).
+setInterval(refreshAll, 15000);     // تحديث شامل دوري.
+</script>
+</body>
+</html>

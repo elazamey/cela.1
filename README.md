@@ -14,6 +14,9 @@
 | ⚙️ CI/CD المكسور/المفقود | يرصد المستودعات بلا أي GitHub Actions workflow ويولّف ملف CI ويفتح PR. |
 | 🐛 المشاكل المفتوحة | يحلّل كل Issue مفتوحة، يولّد اقتراح حل عملي، وينشره كتعليق على المشكلة. |
 | 🛡️ فحص ثغرات Dependabot | يجلب تنبيهات Dependabot لحزم Python (pip)، يحدّد الحزم المُصابة والنسخ الآمنة، ويحدّث `requirements.txt` بذكاء عبر Gemini ويفتح PR أمني (تُجمَع إصلاحات الملف الواحد في PR واحد). |
+| 🟢 فحص أمان Node.js (npm) | تنبيهات Dependabot لمنظومة `npm` تُعالج **بتعديل حتمي** لـ `package.json` (JSON parsing خالص بدون AI): ترقية مباشرة مع الحفاظ على معامل النطاق، و`overrides` للثغرات غير المباشرة — PR أمني واحد لكل manifest. |
+| 🩺 إصلاح الـ CI التالف (CI Healing) | يرصد أحدث تشغيلات GitHub Actions الفاشلة، ينزّل سجلاتها ويختزلها، يحسب **بصمة فشل** حتمية (لا تكرار لنفس الفشل)، يصنّف العائلة (npm/python/docker/shell)، يشخّصها Gemini ويخرج workflow YAML مصححاً في PR على فرع `ci/fix-...`. |
+| 📊 لوحة تحكم ويب | FastAPI + SQLite + JWT + WebSocket: مراقبة حية للتشغيلات والأحداث (مستودعات، PRs، أخطاء) مع بث مباشر، ووضع معاينة DEMO. |
 | 🚫 عدم التكرار | لا يكرر PR لنفس الفرع ولا يكرر التعليق على نفس المشكلة. |
 | 🧪 وضع المعاينة | `--dry-run` يفحص ويعرض ما سيفعله بدون أي كتابة على GitHub. |
 | ⏰ أتمتة يومية | يعمل تلقائياً كل يوم عبر GitHub Actions (أو يدوياً بزر `workflow_dispatch`). |
@@ -29,10 +32,20 @@
 │       └── audit_cron.yml  # جدولة التشغيل اليومي + التشغيل اليدوي
 ├── .gitignore
 ├── agent.py                # الوكيل الرئيسي (نقطة الدخول)
-├── ai_resolver.py          # محرك Gemini لتوليد الملفات وحل المشاكل
+├── ai_resolver.py          # محرك Gemini (ملفات/حلول/تشخيص CI)
+├── ci_healer.py            # (المرحلة 2) معالجة فشل CI: سجلات + بصمات + YAML مصحح
 ├── config.py               # تحميل الإعدادات والتحقق من المفاتيح
 ├── github_service.py       # طبقة التفاعل مع GitHub (PyGithub)
+├── node_analyzer.py        # (المرحلة 2) تحليل/تحديث package.json حتمياً
+├── npm_security.py         # (المرحلة 2) تنبيهات npm → PR أمني
 ├── requirements.txt
+├── tests_smoke.py          # (المرحلة 2) اختبارات دخان خضراء بلا شبكة
+├── web/                    # (المرحلة 2) لوحة التحكم
+│   ├── dashboard.py        #   FastAPI + JWT + WebSocket
+│   ├── recorder.py         #   مسجل أحداث SQLite (يستخدمه الوكيل أيضاً)
+│   └── static/index.html   #   واجهة صفحة واحدة (Tailwind CDN)
+├── docs/
+│   └── NODE_SUPPORT_PLAN.md # (المرحلة 2) خطة دعم Node.js والمرحلة 2
 └── README.md
 ```
 
@@ -57,17 +70,36 @@
    | `GITHUB_USERNAME` | اسم مستخدم GitHub الخاص بك |
    | `GEMINI_MODEL` | اختياري، الافتراضي `gemini-2.5-flash` |
    | `DRY_RUN` | اختياري، `true` للمعاينة بدون أي تغيير |
+   | `CELIA_DB_PATH` | اختياري: مسار قاعدة SQLite لتسجيل التشغيلات (تفعّل تسجيل أحداث اللوحة) |
+   | `CELIA_DASH_TOKEN` | اختياري: توكن لوحة التحكم (JWT)؛ بغيابه تعمل اللوحة في DEMO MODE |
+   | `CELIA_CI_LOOKBACK_DAYS` / `CELIA_CI_MAX_RUNS` | اختياري: ضبط نافذة/سقف فحص CI |
 
    > ⚠️ ملف `.env` الحقيقي متجاهَل في Git ولا يجب أبداً رفعه.
 
 3. شغّل الوكيل:
 
    ```bash
-   # فحص حقيقي: إنشاء PRs وتعليقات
+   # فحص حقيقي: إنشاء PRs وتعليقات (يشمل npm + إصلاح CI)
    python agent.py
 
    # معاينة آمنة: عرض الإجراءات فقط بدون أي كتابة
    python agent.py --dry-run
+
+   # تعطيل أحد المسارات (اختياري)
+   python agent.py --no-npm-security
+   python agent.py --no-ci-heal
+   ```
+
+4. لوحة التحكم (اختياري):
+
+   ```bash
+   # تسجيل أحداث الوكيل (افعلها مرة واحدة ثم شغّل اللوحة)
+   export CELIA_DB_PATH=data/celia.db
+   python agent.py --dry-run        # مثال: يكتب التشغيل إلى القاعدة
+
+   # تشغيل اللوحة (بدون CELIA_DASH_TOKEN تدخل DEMO MODE للمعاينة)
+   uvicorn web.dashboard:app --host 0.0.0.0 --port 8000
+   # ثم افتح http://localhost:8000
    ```
 
 ## ⏰ الأتمتة عبر GitHub Actions
@@ -104,11 +136,14 @@
 ## 🔭 تحسينات مستقبلية مقترحة
 
 - [x] **فحص أمني (Dependabot Alerts):** جلب ثغرات حزم pip وتحديث `requirements.txt`
-  تلقائياً عبر Gemini وفتح PR أمني. (دعم `package.json` وأنظمة أخرى لاحقاً)
-- [ ] **إصلاح أخطاء الـ Build:** قراءة سجلات الفحوصات الفاشلة وإرسالها للنموذج
-  لتسليم Patch تلقائي.
+  تلقائياً عبر Gemini وفتح PR أمني.
+- [x] **فحص أمان Node.js:** تنبيهات npm → تحديث `package.json` حتمي (مباشر/`overrides`) → PR.
+- [x] **إصلاح أخطاء الـ Build (CI Healing):** سجلات الفحوصات الفاشلة → بصمة فشل →
+  تشخيص Gemini → workflow YAML مصحح في PR. (تفاصيل في `docs/NODE_SUPPORT_PLAN.md`)
+- [x] **لوحة تحكم ويب:** FastAPI + SQLite + JWT + WebSocket (أحداث حية).
 - [ ] كشف لغة/حزمة المستودع لتوليد `.gitignore` و README أدق.
 - [ ] حدّ أقصى للـ PRs اليومية وخيار السماح/المنع لكل مستودع.
+- [ ] ترقية اللوحة إلى Next.js و دعم lockfiles (`package-lock.json`, yarn, pnpm).
 
 ## 📜 الرخصة
 

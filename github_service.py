@@ -10,6 +10,7 @@ Responsibilities:
   * Post AI-suggested solutions as comments on open issues.
 """
 
+import datetime as _dt
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +19,10 @@ from github import Auth, Github, GithubException
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+
+class JobLogDownloadError(RuntimeError):
+    """فشل تنزيل سجل وظيفة (job log) من GitHub Actions."""
 
 # Marker label used on PRs/comments created by the agent, so repeated runs
 # can detect work that was already submitted instead of duplicating it.
@@ -115,11 +120,17 @@ class GitHubService:
     # ------------------------------------------------------------------ #
     # Dependabot security alerts
     # ------------------------------------------------------------------ #
-    def get_dependabot_alerts(self, repo: Any) -> List[Dict[str, Any]]:
-        """جلب تنبيهات Dependabot المفتوحة الخاصة بحزم Python (pip).
+    def get_dependabot_alerts(
+        self, repo: Any, ecosystem: str = "pip"
+    ) -> List[Dict[str, Any]]:
+        """جلب تنبيهات Dependabot المفتوحة الخاصة بمنظومة حزم واحدة.
 
         يتطلب ذلك صلاحية ``security_events`` على الـ Personal Access Token
         (أو ``security-events: read`` في GitHub Actions).
+
+        Args:
+            repo: كائن المستودع (PyGithub).
+            ecosystem: اسم المنظومة مثل ``pip`` أو ``npm``.
 
         Returns:
             قائمة بقواميس تصف الثغرات: رقم التنبيه، اسم الحزمة، الخطورة،
@@ -133,8 +144,8 @@ class GitHubService:
                 try:
                     vuln = alert.security_vulnerability
                     package = vuln.package
-                    # تصفية ثغرات Python (pip) فقط
-                    if (package.ecosystem or "").lower() != "pip":
+                    # تصفية ثغرات المنظومة المطلوبة فقط (pip/npm...).
+                    if (package.ecosystem or "").lower() != ecosystem.lower():
                         continue
 
                     # ملاحظة: في PyGithub تكون first_patched_version قاموساً
@@ -146,7 +157,7 @@ class GitHubService:
                         else getattr(patched_info, "identifier", None)
                     )
 
-                    manifest = "requirements.txt"
+                    manifest = "package.json" if ecosystem.lower() == "npm" else "requirements.txt"
                     try:
                         manifest = alert.dependency.manifest_path or manifest
                     except GithubException:
@@ -177,6 +188,84 @@ class GitHubService:
                 exc.status if hasattr(exc, "status") else exc,
             )
         return alerts
+
+    # ------------------------------------------------------------------ #
+    # GitHub Actions runs / jobs / logs (used by the CI healer)
+    # ------------------------------------------------------------------ #
+    def get_recent_failed_runs(
+        self, repo: Any, lookback_days: int = 14, max_runs: int = 5
+    ) -> List[Any]:
+        """استرجاع أحدث تشغيلات GitHub Actions الفاشلة على الفرع الافتراضي.
+
+        يتم استبعاد التشغيلات الداخلية لـ Dependabot (مسارات تبدأ بـ
+        ``dynamic/``) لأنها ليست workflows يملكها المستخدم.
+
+        Args:
+            repo: كائن المستودع.
+            lookback_days: عدد الأيام الماضية للبحث (افتراضي 14).
+            max_runs: الحد الأقصى لعدد التشغيلات الفاشلة المُرجعة.
+
+        Returns:
+            قائمة بكائنات PyGithub ``WorkflowRun`` الفاشلة (الأحدث أولاً).
+        """
+        since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=lookback_days)
+        failed: List[Any] = []
+        try:
+            runs = repo.get_workflow_runs(branch=repo.default_branch, status="completed")
+            for run in runs:
+                created = getattr(run, "created_at", None)
+                if created and created < since:
+                    break  # القائمة مرتبة تنازلياً (الأحدث أولاً).
+                path = (getattr(run, "path", "") or "")
+                if getattr(run, "conclusion", "") == "failure" and not path.startswith(
+                    "dynamic/"
+                ):
+                    failed.append(run)
+                    if len(failed) >= max_runs:
+                        break
+        except GithubException as exc:
+            logger.info("تعذّرت قراءة workflow runs لـ %s: %s", repo.full_name, exc)
+        return failed
+
+    @staticmethod
+    def get_failed_jobs(run: Any) -> List[Any]:
+        """إرجاع وظائف (jobs) التشغيل الفاشلة فقط."""
+        jobs = []
+        try:
+            for job in run.jobs():
+                if job.conclusion == "failure":
+                    jobs.append(job)
+        except GithubException as exc:
+            logger.warning("تعذّرت قراءة وظائف التشغيل %s: %s", getattr(run, "id", "?"), exc)
+        return jobs
+
+    @staticmethod
+    def download_job_log(job: Any, timeout: int = 90) -> str:
+        """تنزيل السجل الكامل لوظيفة فاشلة وإرجاعه كنص.
+
+        Raises:
+            JobLogDownloadError: عند فشل التنزيل (شبكة/رابط منتهي/حظر نطاق).
+        """
+        import requests
+
+        try:
+            location = job.logs_url()
+            resp = requests.get(location, timeout=timeout, stream=True)
+            resp.raise_for_status()
+            return resp.text
+        except Exception as exc:  # noqa: BLE001 - فشل الشبكة بأنواعها كلها
+            raise JobLogDownloadError(
+                f"فشل تنزيل سجل الوظيفة {getattr(job, 'id', '?')}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def read_file_content(repo: Any, path: str) -> Optional[str]:
+        """قراءة محتوى ملف نصي من الفرع الافتراضي (أو None إن غاب)."""
+        try:
+            obj = repo.get_contents(path)
+            return obj.decoded_content.decode("utf-8", errors="replace")
+        except GithubException:
+            return None
 
     # ------------------------------------------------------------------ #
     # Fix application

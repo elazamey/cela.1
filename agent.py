@@ -10,12 +10,23 @@ Usage:
 
 import argparse
 import logging
+import os
 
 from github import GithubException
 
 from ai_resolver import AIResolver
+from ci_healer import CiHealer
 from config import Config
 from github_service import AGENT_BOT_SIGNATURE, GitHubService
+from npm_security import NpmSecurity
+
+# تسجيل أحداث SQLite اختياري (تفعّله اللوحة؛ الفشل فيه لا يكسر التشغيل).
+try:
+    from web.recorder import Recorder as _Recorder
+
+    _recorder = _Recorder() if os.environ.get("CELIA_DB_PATH") else None
+except Exception:  # noqa: BLE001 - الوكيل يعمل حتى بدون مسجل
+    _recorder = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,34 +38,76 @@ logger = logging.getLogger("celia-agent")
 class RepoAgent:
     """ينسّق بين طبقة GitHub ومحرك الذكاء الاصطناعي."""
 
-    def __init__(self, dry_run: bool = False) -> None:
+    def __init__(
+        self,
+        dry_run: bool = False,
+        npm_security: bool = True,
+        ci_heal: bool = True,
+    ) -> None:
         self.dry_run = dry_run or Config.DRY_RUN
         self.github = GitHubService()
         self.ai = AIResolver()
+        self.npm_security = npm_security
+        self.ci_heal = ci_heal
+        self.run_id = None
+        self.stats = {
+            "repos_scanned": 0,
+            "prs_created": 0,
+            "comments_posted": 0,
+            "errors": 0,
+        }
+        if _recorder is not None:
+            self.run_id = _recorder.start_run(
+                mode="dry-run" if self.dry_run else "auto"
+            )
         if self.dry_run:
             logger.info("🔎 وضع المعاينة DRY-RUN مفعّل: لن يتم إنشاء أي PR أو تعليق.")
+
+    # ------------------------------------------------------------------ #
+    # Event recording
+    # ------------------------------------------------------------------ #
+    def _event(self, level: str, message: str, repo_name: str = "") -> None:
+        if _recorder is not None:
+            _recorder.add_event(self.run_id, level=level, message=message, repo=repo_name)
 
     # ------------------------------------------------------------------ #
     # Main flow
     # ------------------------------------------------------------------ #
     def run(self) -> None:
         logger.info("🚀 بدء تشغيل وكيل إدارة المستودعات (Celia Repo Agent)...")
-        repos = self.github.get_all_repositories()
-        logger.info("تم العثور على %d مستودع مملوك للمستخدم.", len(repos))
+        try:
+            repos = self.github.get_all_repositories()
+            logger.info("تم العثور على %d مستودع مملوك للمستخدم.", len(repos))
 
-        for repo in repos:
-            try:
-                self._process_repository(repo)
-            except GithubException as exc:
-                # خطأ في مستودع واحد يجب ألا يوقف الفحص بالكامل.
-                logger.error("❌ تخطّي المستودع %s بسبب خطأ GitHub: %s", repo.name, exc)
-            except Exception as exc:  # noqa: BLE001 - keep the cron run alive
-                logger.exception("❌ خطأ غير متوقع أثناء معالجة %s: %s", repo.name, exc)
-
+            for repo in repos:
+                self.stats["repos_scanned"] += 1
+                try:
+                    self._process_repository(repo)
+                except GithubException as exc:
+                    # خطأ في مستودع واحد يجب ألا يوقف الفحص بالكامل.
+                    self.stats["errors"] += 1
+                    logger.error("❌ تخطّي المستودع %s بسبب خطأ GitHub: %s", repo.name, exc)
+                    self._event("error", f"تخطّي {repo.name}: خطأ GitHub", repo.name)
+                except Exception as exc:  # noqa: BLE001 - keep the cron run alive
+                    self.stats["errors"] += 1
+                    logger.exception("❌ خطأ غير متوقع أثناء معالجة %s: %s", repo.name, exc)
+                    self._event("error", f"خطأ غير متوقع في {repo.name}: {exc}", repo.name)
+        finally:
+            if _recorder is not None and self.run_id is not None:
+                _recorder.finish_run(
+                    run_id=self.run_id,
+                    status="finished",
+                    repos_scanned=self.stats["repos_scanned"],
+                    prs_created=self.stats["prs_created"],
+                    comments_posted=self.stats["comments_posted"],
+                    errors=self.stats["errors"],
+                )
+                self._event("info", "🏁 انتهت عملية الفحص والإصلاح.")
         logger.info("🏁 انتهت عملية الفحص والإصلاح.")
 
     def _process_repository(self, repo) -> None:
         logger.info("🔍 فحص المستودع: %s", repo.full_name)
+        self._event("info", f"🔍 فحص المستودع: {repo.full_name}", repo.name)
         audit_result = self.github.audit_repository(repo)
         issues = audit_result["issues"]
 
@@ -62,10 +115,12 @@ class RepoAgent:
             logger.info("✅ المستودع %s لا يحتوي على مشاكل ملفات/CI ظاهرة.", repo.name)
         else:
             logger.info("⚠️ تم رصد %d مشكلة في %s.", len(issues), repo.name)
+            self._event("warning", f"رصد {len(issues)} مشكلة في {repo.name}", repo.name)
             for issue in issues:
                 try:
                     self._handle_issue(repo, issue)
                 except Exception as exc:  # noqa: BLE001 - isolate per-issue failures
+                    self.stats["errors"] += 1
                     logger.exception(
                         "❌ فشل التعامل مع مشكلة من النوع %s في %s: %s",
                         issue.get("type"),
@@ -77,7 +132,24 @@ class RepoAgent:
         try:
             self._process_dependabot_alerts(repo)
         except Exception as exc:  # noqa: BLE001 - لا تُوقف الفحص بسبب فشل أمني
+            self.stats["errors"] += 1
             logger.exception("❌ فشل فحص Dependabot في %s: %s", repo.name, exc)
+
+        # فحص أمان npm (Node.js) — تحديث package.json حتمي.
+        if self.npm_security:
+            try:
+                self._process_npm_security(repo)
+            except Exception as exc:  # noqa: BLE001
+                self.stats["errors"] += 1
+                logger.exception("❌ فشل فحص أمان npm في %s: %s", repo.name, exc)
+
+        # معالجة فشل الـ CI (تشخيص + PR إصلاح workflow).
+        if self.ci_heal:
+            try:
+                self._process_ci_healing(repo)
+            except Exception as exc:  # noqa: BLE001
+                self.stats["errors"] += 1
+                logger.exception("❌ فشل معالجة CI في %s: %s", repo.name, exc)
 
     # ------------------------------------------------------------------ #
     # Issue handlers
@@ -125,7 +197,9 @@ class RepoAgent:
             pr_title=pr_title,
             pr_body=pr_body,
         )
+        self.stats["prs_created"] += 1
         logger.info("🎉 تم إنشاء Pull Request بنجاح: %s", pr_url)
+        self._event("success", f"🎉 PR لإضافة {target_file}: {pr_url}", repo.name)
 
     def _suggest_fix_for_open_issue(self, repo, issue: dict) -> None:
         """توليد اقتراح حل عبر الذكاء الاصطناعي ونشره كتعليق على المشكلة."""
@@ -165,11 +239,11 @@ class RepoAgent:
             return
 
         url = self.github.post_issue_comment(repo, issue_number, comment)
+        self.stats["comments_posted"] += 1
         logger.info("📝 تم نشر اقتراح الحل على المشكلة: %s", url)
 
     def _process_dependabot_alerts(self, repo) -> None:
         """جلب تنبيهات Dependabot، وتحديث ملفات الاعتماديات، وفتح PR أمني.
-
         تُجمَّع كل إصلاحات ملف اعتماديات واحد (مثل requirements.txt) في
         Pull Request واحد تراكمي، لأن كل PR يستبدل الملف كاملاً عن الفرع
         الأساسي؛ ففتح PR منفصل لكل حزمة كان سيُلغي إصلاح البقية.
@@ -306,7 +380,46 @@ class RepoAgent:
             pr_title=pr_title,
             pr_body=pr_body,
         )
+        self.stats["prs_created"] += 1
         logger.info("🎉 تم فتح PR الإصلاح الأمني: %s", pr_url)
+
+    # ------------------------------------------------------------------ #
+    # npm (Node.js) security + CI healing (Phase 2)
+    # ------------------------------------------------------------------ #
+    def _process_npm_security(self, repo) -> None:
+        """معالجة تنبيهات Dependabot npm بتحديث package.json حتمي وفتح PR."""
+        handler = NpmSecurity(self.github, dry_run=self.dry_run)
+        stats = handler.process_repository(repo)
+        if stats["prs_created"]:
+            if not self.dry_run:
+                self.stats["prs_created"] += stats["prs_created"]
+            self._event(
+                "success",
+                f"🛡️ فتح {stats['prs_created']} PR أمني npm في {repo.name}",
+                repo.name,
+            )
+        elif stats["prs_already_open"]:
+            self._event(
+                "info",
+                f"⏭️ PRs npm مفتوحة مسبقاً في {repo.name} — تخطّي.",
+                repo.name,
+            )
+
+    def _process_ci_healing(self, repo) -> None:
+        """تشخيص فشل الـ CI عبر Gemini وفتح PR workflow مصحح."""
+        healer = CiHealer(self.github, self.ai, dry_run=self.dry_run)
+        stats = healer.heal_repository(repo)
+        if stats["failed_runs"]:
+            self._event(
+                "warning"
+                if stats["prs_created"] == 0
+                else "success",
+                f"🩺 CI في {repo.name}: {stats['failed_runs']} تشغيل فاشل، "
+                f"{stats['prs_created']} PR إصلاح.",
+                repo.name,
+            )
+            if stats["prs_created"] and not self.dry_run:
+                self.stats["prs_created"] += stats["prs_created"]
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -354,9 +467,23 @@ def main() -> None:
         action="store_true",
         help="فحص المستودعات وعرض الإجراءات فقط بدون إنشاء PRs أو تعليقات.",
     )
+    parser.add_argument(
+        "--no-npm-security",
+        action="store_true",
+        help="تعطيل فحص ثغرات Dependabot npm وتحديث package.json.",
+    )
+    parser.add_argument(
+        "--no-ci-heal",
+        action="store_true",
+        help="تعطيل تشخيص فشل الـ CI وفتح PRs إصلاح workflows.",
+    )
     args = parser.parse_args()
 
-    agent = RepoAgent(dry_run=args.dry_run)
+    agent = RepoAgent(
+        dry_run=args.dry_run,
+        npm_security=not args.no_npm_security,
+        ci_heal=not args.no_ci_heal,
+    )
     agent.run()
 
 
