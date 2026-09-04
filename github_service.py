@@ -53,6 +53,37 @@ class GitHubService:
                 logger.warning("تعذّرت قراءة مستودع: %s", exc)
         return owned
 
+    def get_repository(self, identifier: str) -> Optional[Any]:
+        """استرجاع مستودع واحد محدد للفحص المستهدف.
+
+        يقبل ``OWNER/NAME`` (استعلام مباشر عبر الـ API) أو اسم المستودع فقط
+        (بحث بين المستودعات المملوكة، بنفس فلاتر :meth:`get_all_repositories`).
+
+        Returns:
+            المستودع المطلوب أو ``None`` إن لم يوجد / لم يكن متاحاً للتوكن.
+        """
+        identifier = (identifier or "").strip()
+        if not identifier:
+            return None
+
+        if "/" in identifier:
+            try:
+                return self.client.get_repo(identifier)
+            except GithubException as exc:
+                logger.warning("تعذّر جلب المستودع %s: %s", identifier, exc)
+                return None
+
+        # اسم فقط: ابحث بين المستودعات المملوكة (مطابقة غير حساسة للحالة).
+        wanted = identifier.lower()
+        for repo in self.get_all_repositories():
+            try:
+                if repo.name.lower() == wanted or repo.full_name.lower() == wanted:
+                    return repo
+            except GithubException as exc:  # pragma: no cover - defensive
+                logger.warning("تعذّرت قراءة مستودع: %s", exc)
+        logger.warning("لم يُعثر على مستودع مملوك باسم: %s", identifier)
+        return None
+
     # ------------------------------------------------------------------ #
     # Auditing
     # ------------------------------------------------------------------ #
