@@ -99,6 +99,45 @@ class AIResolver:
         logger.info("توليد محتوى الملف %s عبر نموذج %s", file_name, self.model)
         return self._generate(prompt)
 
+    def update_requirements_file(
+        self, current_content: str, package_name: str, target_version: str
+    ) -> str:
+        """تحديث نسخة حزمة مُصابة داخل requirements.txt مع الحفاظ على الباقي.
+
+        يطلب من النموذج تعديل سطر الحزمة فقط (مثل ``package>=target`` أو
+        ``package==target``) مع الإبقاء على جميع الحزم الأخرى والتعليقات
+        والتنسيقات كما هي، وإضافة الحزمة في أسفل الملف إن كانت مفقودة.
+
+        Args:
+            current_content: النص الحالي لملف requirements.txt.
+            package_name: اسم الحزمة المُصابة.
+            target_version: أول نسخة آمنة (patched version).
+
+        Returns:
+            المحتوى المحدَّث للملف جاهزاً للالتزام (commit).
+        """
+        prompt = f"""
+لديك محتوى ملف requirements.txt التالي:
+```text
+{current_content}
+```
+
+المطلوب:
+قم بتحديث الحزمة '{package_name}' لتكون مثبتة بالنسخة الآمنة '{target_version}'
+(مثال: {package_name}>={target_version} أو {package_name}=={target_version}).
+- إذا كانت الحزمة غير موجودة صراحةً (أو مضافة عبر ملحق -r)، أضفها في سطر جديد
+  بأسفل الملف بصيغة {package_name}>={target_version}.
+- حدّث القيد فقط إن كان أقل من النسخة الآمنة، وأبقِ صيغة القيد كما هي (== أو >=).
+- حافظ على جميع الحزم الأخرى والتعليقات والترتيب والتنسيق دون أي تغيير.
+- أرجع المحتوى النهائي للملف فقط، بدون أي أغلفة markdown (```) أو شروحات.
+"""
+        logger.info(
+            "توليد تحديث requirements.txt: %s -> النسخة الآمنة %s",
+            package_name,
+            target_version,
+        )
+        return self._generate(prompt)
+
     def solve_issue_code(self, repo_name: str, issue_title: str, issue_body: str) -> str:
         """تحليل مشكلة مفتوحة وتوليد اقتراح حل لها (كود أو خطوات إصلاح)."""
         prompt = f"""

@@ -113,6 +113,72 @@ class GitHubService:
         return False
 
     # ------------------------------------------------------------------ #
+    # Dependabot security alerts
+    # ------------------------------------------------------------------ #
+    def get_dependabot_alerts(self, repo: Any) -> List[Dict[str, Any]]:
+        """جلب تنبيهات Dependabot المفتوحة الخاصة بحزم Python (pip).
+
+        يتطلب ذلك صلاحية ``security_events`` على الـ Personal Access Token
+        (أو ``security-events: read`` في GitHub Actions).
+
+        Returns:
+            قائمة بقواميس تصف الثغرات: رقم التنبيه، اسم الحزمة، الخطورة،
+            النطاق المُصاب، النسخة المُصلِحة، ملخص الثغرة، معرّف GHSA،
+            ومسار ملف الاعتماديات (manifest).
+        """
+        alerts: List[Dict[str, Any]] = []
+        try:
+            dependabot_alerts = repo.get_dependabot_alerts(state="open")
+            for alert in dependabot_alerts:
+                try:
+                    vuln = alert.security_vulnerability
+                    package = vuln.package
+                    # تصفية ثغرات Python (pip) فقط
+                    if (package.ecosystem or "").lower() != "pip":
+                        continue
+
+                    # ملاحظة: في PyGithub تكون first_patched_version قاموساً
+                    # مثل {"identifier": "2.3.4"} وليست كائناً.
+                    patched_info = vuln.first_patched_version or {}
+                    patched_ver = (
+                        patched_info.get("identifier")
+                        if isinstance(patched_info, dict)
+                        else getattr(patched_info, "identifier", None)
+                    )
+
+                    manifest = "requirements.txt"
+                    try:
+                        manifest = alert.dependency.manifest_path or manifest
+                    except GithubException:
+                        pass
+
+                    alerts.append(
+                        {
+                            "number": alert.number,
+                            "package_name": package.name,
+                            "severity": vuln.severity,
+                            "vulnerable_range": vuln.vulnerable_version_range,
+                            "patched_version": patched_ver,
+                            "summary": alert.security_advisory.summary,
+                            "ghsa_id": alert.security_advisory.ghsa_id,
+                            "manifest": manifest,
+                        }
+                    )
+                except GithubException:
+                    # تنبيه واحد غير قابل للقراءة يجب ألا يُسقط البقية.
+                    continue
+        except GithubException as exc:
+            # 403/404: التوكن يفتقد صلاحية security_events أو Dependabot
+            # غير مفعّل على المستودع — يتم التخطّي بهدوء.
+            logger.info(
+                "تعذّر جلب تنبيهات Dependabot لـ %s (قد يلزم تفعيل "
+                "Dependabot أو منح صلاحية security_events): %s",
+                repo.full_name,
+                exc.status if hasattr(exc, "status") else exc,
+            )
+        return alerts
+
+    # ------------------------------------------------------------------ #
     # Fix application
     # ------------------------------------------------------------------ #
     def create_fix_branch_and_pr(

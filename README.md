@@ -13,7 +13,8 @@
 | 📄 الملفات المفقودة | يرصد غياب `README.md` و `.gitignore` ويولّد محتواهما عبر Gemini ثم يفتح PR. |
 | ⚙️ CI/CD المكسور/المفقود | يرصد المستودعات بلا أي GitHub Actions workflow ويولّف ملف CI ويفتح PR. |
 | 🐛 المشاكل المفتوحة | يحلّل كل Issue مفتوحة، يولّد اقتراح حل عملي، وينشره كتعليق على المشكلة. |
-| 🛡️ عدم التكرار | لا يكرر PR لنفس الفرع ولا يكرر التعليق على نفس المشكلة. |
+| 🛡️ فحص ثغرات Dependabot | يجلب تنبيهات Dependabot لحزم Python (pip)، يحدّد الحزم المُصابة والنسخ الآمنة، ويحدّث `requirements.txt` بذكاء عبر Gemini ويفتح PR أمني (تُجمَع إصلاحات الملف الواحد في PR واحد). |
+| 🚫 عدم التكرار | لا يكرر PR لنفس الفرع ولا يكرر التعليق على نفس المشكلة. |
 | 🧪 وضع المعاينة | `--dry-run` يفحص ويعرض ما سيفعله بدون أي كتابة على GitHub. |
 | ⏰ أتمتة يومية | يعمل تلقائياً كل يوم عبر GitHub Actions (أو يدوياً بزر `workflow_dispatch`). |
 | 🧱 عزل الأخطاء | فشل مستودع أو مشكلة واحدة لا يوقف بقية الفحص. |
@@ -51,7 +52,7 @@
 
    | المتغير | المصدر |
    | --- | --- |
-   | `GITHUB_TOKEN` | [Personal Access Token](https://github.com/settings/tokens) كلاسيكي بصلاحية **`repo`** |
+   | `GITHUB_TOKEN` | [Personal Access Token](https://github.com/settings/tokens) كلاسيكي بصلاحية **`repo`** + **`security_events`** (لجلب تنبيهات Dependabot) |
    | `GEMINI_API_KEY` | [مفتاح Gemini من Google AI Studio](https://aistudio.google.com/apikey) |
    | `GITHUB_USERNAME` | اسم مستخدم GitHub الخاص بك |
    | `GEMINI_MODEL` | اختياري، الافتراضي `gemini-2.5-flash` |
@@ -91,12 +92,19 @@
      عبر Gemini → يُنشأ فرع `fix/missing-...` و commit و **Pull Request**.
    - Issue مفتوحة → `AIResolver.solve_issue_code()` يولّد اقتراح حل →
      يُنشر **كتعليق** على المشكلة (آمن وغير مدمِّر، مع إخلاء مسؤولية المراجعة).
+   - تنبيهات Dependabot (pip) → `get_dependabot_alerts()` يجلب الثغرات والنسخ
+     الآمنة → `AIResolver.update_requirements_file()` يحدّث أسطر الحزم المُصابة
+     فقط مع الحفاظ على بقية الملف → يُفتح **PR أمني** (إصلاحات كل ملف في PR واحد).
 4. كل ما يولّده الذكاء الاصطناعي موسوم بتوقيع البوت ويحتاج مراجعتك قبل الدمج.
+
+> ℹ️ **متطلب صلاحية Dependabot:** يجب أن يتضمن الـ PAT نطاق **`security_events`**
+> (التوكن الكلاسيكي) أو صلاحية *Dependabot alerts → read* للتوكن الدقيق، وفي
+> GitHub Actions أُضيفت `security-events: read` داخل الـ workflow.
 
 ## 🔭 تحسينات مستقبلية مقترحة
 
-- [ ] **فحص أمني (Dependabot Alerts):** جلب ثغرات الحزم وتحديث `requirements.txt`
-  أو `package.json` تلقائياً.
+- [x] **فحص أمني (Dependabot Alerts):** جلب ثغرات حزم pip وتحديث `requirements.txt`
+  تلقائياً عبر Gemini وفتح PR أمني. (دعم `package.json` وأنظمة أخرى لاحقاً)
 - [ ] **إصلاح أخطاء الـ Build:** قراءة سجلات الفحوصات الفاشلة وإرسالها للنموذج
   لتسليم Patch تلقائي.
 - [ ] كشف لغة/حزمة المستودع لتوليد `.gitignore` و README أدق.

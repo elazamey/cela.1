@@ -10,11 +10,6 @@ on:
         required: false
         default: 'false'
 
-permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-
 # منع تداخل نسختين من الجدولة اليومية.
 concurrency:
   group: celia-audit-agent
@@ -23,6 +18,11 @@ concurrency:
 jobs:
   audit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write          # إنشاء فروع وملفات و commits
+      pull-requests: write     # فتح Pull Requests
+      issues: write            # التعليق على المشاكل المفتوحة
+      security-events: read    # قراءة تنبيهات Dependabot (يتطلبها جلب الثغرات)
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
