@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 # مفاتيح وهمية (ليست placeholder من .env.example فلا يرفضها Config).
 os.environ.setdefault("GITHUB_TOKEN", "fake_github_token_for_tests")
@@ -367,6 +368,121 @@ class TestWebRecorder(unittest.TestCase):
             demo_seed(rec, runs=1, events_per_run=2)
             self.assertEqual(len(rec.get_runs(limit=10)), 1)
             rec.close()
+
+
+class TestRepoAgentTargeting(unittest.TestCase):
+    """وضع الفحص المستهدف --repo: مستودع واحد فقط، بدون أي شبكة."""
+
+    class _FakeRecorder:
+        def __init__(self):
+            self.started = []
+            self.events = []
+            self.finished = None
+
+        def start_run(self, mode="", meta=None):
+            self.started.append((mode, meta or {}))
+            return 7
+
+        def add_event(self, run_id, level="info", message="", repo=None):
+            self.events.append((run_id, level, message, repo))
+
+        def finish_run(self, run_id, status="finished", **kwargs):
+            self.finished = (run_id, status, kwargs)
+
+    class _FakeGithub:
+        """نسخة بلا شبكة من GitHubService (نفس منطق الحسم والفحص)."""
+
+        def __init__(self, repos, available=None):
+            self.repos = repos
+            self.available = available or {r.full_name: r for r in repos}
+            self.calls = {"all": 0, "one": []}
+
+        def get_all_repositories(self):
+            self.calls["all"] += 1
+            return self.repos
+
+        def get_repository(self, identifier):
+            identifier = (identifier or "").strip()
+            self.calls["one"].append(identifier)
+            if "/" in identifier:
+                return self.available.get(identifier)
+            # نفس السلوك الحقيقي: حسم الاسم عبر قائمة المستودعات المملوكة.
+            wanted = identifier.lower()
+            for repo in self.get_all_repositories():
+                if repo.name.lower() == wanted or repo.full_name.lower() == wanted:
+                    return repo
+            return None
+
+        def audit_repository(self, repo):
+            return {"issues": []}
+
+        def get_dependabot_alerts(self, repo):
+            return []
+
+    @staticmethod
+    def _stub_handlers():
+        return patch.multiple(
+            "agent",
+            NpmSecurity=lambda gh, dry_run=False: SimpleNamespace(
+                process_repository=lambda repo: {
+                    "prs_created": 0,
+                    "prs_already_open": 0,
+                }
+            ),
+            CiHealer=lambda gh, ai, dry_run=False: SimpleNamespace(
+                heal_repository=lambda repo: {"failed_runs": 0, "prs_created": 0}
+            ),
+        )
+
+    def _make_agent(self, gh, recorder, repo):
+        from agent import RepoAgent
+
+        with patch("agent.GitHubService", return_value=gh), patch(
+            "agent.AIResolver", return_value=object()
+        ), patch("agent._recorder", recorder), self._stub_handlers():
+            agent = RepoAgent(dry_run=True, repo=repo)
+            agent.run()
+        return agent
+
+    def test_targeted_scan_processes_only_requested_repo(self):
+        a = SimpleNamespace(full_name="owner/a", name="a")
+        b = SimpleNamespace(full_name="owner/b", name="b")
+        gh = self._FakeGithub([a, b], available={"owner/b": b})
+        rec = self._FakeRecorder()
+        agent = self._make_agent(gh, rec, repo="owner/b")
+
+        self.assertEqual(gh.calls["all"], 0)  # لا فحص شامل إطلاقاً
+        self.assertEqual(gh.calls["one"], ["owner/b"])
+        self.assertEqual(agent.stats["repos_scanned"], 1)
+        self.assertEqual(agent.stats["errors"], 0)
+        self.assertEqual(rec.started, [("targeted", {"repo": "owner/b"})])
+        self.assertEqual(rec.finished[1], "finished")
+        messages = [m for _, _, m, _ in rec.events]
+        self.assertIn("🎯 فحص مستهدف: owner/b", messages)
+        self.assertIn("🔍 فحص المستودع: owner/b", messages)
+
+    def test_targeted_bare_name_resolved_among_owned(self):
+        a = SimpleNamespace(full_name="owner/a", name="a")
+        b = SimpleNamespace(full_name="owner/b", name="b")
+        gh = self._FakeGithub([a, b])
+        rec = self._FakeRecorder()
+        agent = self._make_agent(gh, rec, repo="b")
+
+        self.assertEqual(gh.calls["one"], ["b"])
+        self.assertEqual(gh.calls["all"], 1)  # حسم الاسم فقط عبر المستودعات المملوكة
+        self.assertEqual(agent.stats["repos_scanned"], 1)
+        self.assertEqual(rec.started, [("targeted", {"repo": "b"})])
+
+    def test_targeted_missing_repo_records_error(self):
+        gh = self._FakeGithub([], available={})
+        rec = self._FakeRecorder()
+        agent = self._make_agent(gh, rec, repo="owner/ghost")
+
+        self.assertEqual(agent.stats["repos_scanned"], 0)
+        self.assertEqual(agent.stats["errors"], 1)
+        self.assertEqual(rec.finished[1], "error")
+        messages = [m for _, _, m, _ in rec.events]
+        self.assertTrue(any("غير موجود" in m for m in messages))
 
 
 if __name__ == "__main__":

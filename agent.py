@@ -6,11 +6,13 @@ Entry point for Celia Repo Agent.
 Usage:
     python agent.py             # audit + open PRs / post comments
     python agent.py --dry-run   # audit only, log what would be done
+    python agent.py --repo elazamey/cela.1   # audit a single repository
 """
 
 import argparse
 import logging
 import os
+from typing import Optional
 
 from github import GithubException
 
@@ -43,13 +45,16 @@ class RepoAgent:
         dry_run: bool = False,
         npm_security: bool = True,
         ci_heal: bool = True,
+        repo: Optional[str] = None,
     ) -> None:
         self.dry_run = dry_run or Config.DRY_RUN
         self.github = GitHubService()
         self.ai = AIResolver()
         self.npm_security = npm_security
         self.ci_heal = ci_heal
+        self.repo = (repo or "").strip() or None
         self.run_id = None
+        self.finish_status = "finished"
         self.stats = {
             "repos_scanned": 0,
             "prs_created": 0,
@@ -57,11 +62,18 @@ class RepoAgent:
             "errors": 0,
         }
         if _recorder is not None:
+            if self.repo:
+                mode = "targeted"
+            else:
+                mode = "dry-run" if self.dry_run else "auto"
             self.run_id = _recorder.start_run(
-                mode="dry-run" if self.dry_run else "auto"
+                mode=mode,
+                meta={"repo": self.repo} if self.repo else None,
             )
         if self.dry_run:
             logger.info("🔎 وضع المعاينة DRY-RUN مفعّل: لن يتم إنشاء أي PR أو تعليق.")
+        if self.repo:
+            logger.info("🎯 وضع الفحص المستهدف: %s", self.repo)
 
     # ------------------------------------------------------------------ #
     # Event recording
@@ -76,8 +88,25 @@ class RepoAgent:
     def run(self) -> None:
         logger.info("🚀 بدء تشغيل وكيل إدارة المستودعات (Celia Repo Agent)...")
         try:
-            repos = self.github.get_all_repositories()
-            logger.info("تم العثور على %d مستودع مملوك للمستخدم.", len(repos))
+            if self.repo:
+                repo = self.github.get_repository(self.repo)
+                if repo is None:
+                    self.stats["errors"] = 1
+                    self.finish_status = "error"
+                    logger.error(
+                        "❌ لم يُعثر على المستودع المطلوب: %s — لن يتم أي فحص.",
+                        self.repo,
+                    )
+                    self._event(
+                        "error", f"المستودع المطلوب غير موجود: {self.repo}"
+                    )
+                    return
+                repos = [repo]
+                logger.info("🎯 فحص مستهدف: %s", repo.full_name)
+                self._event("info", f"🎯 فحص مستهدف: {repo.full_name}", repo.name)
+            else:
+                repos = self.github.get_all_repositories()
+                logger.info("تم العثور على %d مستودع مملوك للمستخدم.", len(repos))
 
             for repo in repos:
                 self.stats["repos_scanned"] += 1
@@ -96,14 +125,16 @@ class RepoAgent:
             if _recorder is not None and self.run_id is not None:
                 _recorder.finish_run(
                     run_id=self.run_id,
-                    status="finished",
+                    status=self.finish_status,
                     repos_scanned=self.stats["repos_scanned"],
                     prs_created=self.stats["prs_created"],
                     comments_posted=self.stats["comments_posted"],
                     errors=self.stats["errors"],
                 )
-                self._event("info", "🏁 انتهت عملية الفحص والإصلاح.")
-        logger.info("🏁 انتهت عملية الفحص والإصلاح.")
+                if self.finish_status != "error":
+                    self._event("info", "🏁 انتهت عملية الفحص والإصلاح.")
+        if self.finish_status != "error":
+            logger.info("🏁 انتهت عملية الفحص والإصلاح.")
 
     def _process_repository(self, repo) -> None:
         logger.info("🔍 فحص المستودع: %s", repo.full_name)
@@ -477,12 +508,22 @@ def main() -> None:
         action="store_true",
         help="تعطيل تشخيص فشل الـ CI وفتح PRs إصلاح workflows.",
     )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        metavar="OWNER/NAME",
+        help=(
+            "فحص مستودع واحد محدد فقط (مثل elazamey/cela.1 أو cela.1) "
+            "بدلاً من فحص جميع المستودعات المملوكة."
+        ),
+    )
     args = parser.parse_args()
 
     agent = RepoAgent(
         dry_run=args.dry_run,
         npm_security=not args.no_npm_security,
         ci_heal=not args.no_ci_heal,
+        repo=args.repo,
     )
     agent.run()
 

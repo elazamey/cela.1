@@ -49,7 +49,10 @@
       <div class="lg:col-span-2 rounded-xl bg-slate-900 border border-slate-800 overflow-hidden">
         <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
           <h2 class="font-semibold text-sm">التشغيلات الأخيرة</h2>
-          <span class="text-xs text-slate-500" id="runCount"></span>
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-slate-500" id="runCount"></span>
+            <button id="followBtn" onclick="toggleFollow()" title="عند تفعيله تنتقل اللوحة تلقائياً لأحدث تشغيل" class="text-xs px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 transition">🔴 تتبع تلقائي</button>
+          </div>
         </div>
         <div class="max-h-[520px] overflow-y-auto" id="runsList"></div>
       </div>
@@ -82,6 +85,8 @@ let RUNS = [];
 let EVENTS = [];
 let CURRENT_RUN = null;
 let LATEST_EVENT_ID = 0;
+let AUTO_FOLLOW = true;
+let followTimer = null;
 let WS = null;
 const LEVEL_STYLE = {
   info:    "text-slate-300",
@@ -133,8 +138,13 @@ function connectWS() {
     try {
       const data = JSON.parse(msg.data);
       if (data.type === "event" && data.event) {
-        EVENTS.push(data.event);
-        if (!CURRENT_RUN || data.event.run_id === CURRENT_RUN) renderEvents();
+        // تشغيل أحدث من المحدد حالياً: ننتقل إليه تلقائياً (عند تفعيل التتبع).
+        if (AUTO_FOLLOW && data.event.run_id && data.event.run_id > (CURRENT_RUN || 0)) {
+          scheduleFollow(data.event.run_id);
+        } else {
+          EVENTS.push(data.event);
+          if (!CURRENT_RUN || data.event.run_id === CURRENT_RUN) renderEvents();
+        }
         renderKpis();
       }
     } catch (e) { /* تجاهل */ }
@@ -173,12 +183,52 @@ function renderRuns() {
   }).join("") || '<div class="p-6 text-center text-slate-500 text-sm">لا توجد تشغيلات بعد</div>';
 }
 
-function selectRun(id) {
+function updateFollowBtn() {
+  const btn = document.getElementById("followBtn");
+  if (!btn) return;
+  btn.textContent = AUTO_FOLLOW ? "🔴 تتبع تلقائي" : "⚪ التتبع متوقف";
+  btn.className = "text-xs px-2 py-1 rounded-lg transition " + (AUTO_FOLLOW
+    ? "bg-brand-600 hover:bg-brand-500"
+    : "bg-slate-800 hover:bg-slate-700");
+  btn.title = AUTO_FOLLOW
+    ? "تنتقل اللوحة تلقائياً لأحدث تشغيل (انقر للإيقاف)"
+    : "التتبع متوقف — انقر للعودة للانتقال التلقائي لأحدث تشغيل";
+}
+
+function toggleFollow() {
+  AUTO_FOLLOW = !AUTO_FOLLOW;
+  updateFollowBtn();
+  if (AUTO_FOLLOW && RUNS.length && RUNS[0].id !== CURRENT_RUN) scheduleFollow(RUNS[0].id);
+}
+
+function showRun(id) {
+  if (CURRENT_RUN === id) return;
   CURRENT_RUN = id;
   EVENTS = [];
   LATEST_EVENT_ID = 0;
   renderRuns();
   loadEvents();
+}
+
+// تجميع عدة أحداث متتالية في انتقال واحد (يمنع طلبات مكررة).
+function scheduleFollow(runId) {
+  if (!AUTO_FOLLOW) return;
+  if (followTimer) clearTimeout(followTimer);
+  followTimer = setTimeout(() => {
+    followTimer = null;
+    if (!AUTO_FOLLOW) return;
+    const target = runId && runId > (CURRENT_RUN || 0)
+      ? runId
+      : (RUNS.length ? RUNS[0].id : null);
+    if (target && target !== CURRENT_RUN) showRun(target);
+  }, 250);
+}
+
+function selectRun(id) {
+  // الاختيار اليدوي يوقف التتبع حتى لا تُسحب اللوحة بعيداً عن التشغيل المحدد.
+  AUTO_FOLLOW = false;
+  updateFollowBtn();
+  showRun(id);
 }
 
 function renderEvents() {
@@ -207,8 +257,15 @@ async function refreshAll() {
     RUNS = runsData.runs;
     renderRuns();
     renderKpis();
-    if (!CURRENT_RUN && RUNS.length) CURRENT_RUN = RUNS[0].id;
-    await loadEvents();
+    if (CURRENT_RUN === null && RUNS.length) {
+      // أول تحميل: اعرض أحدث تشغيل مباشرة.
+      showRun(RUNS[0].id);
+    } else if (AUTO_FOLLOW && RUNS.length && RUNS[0].id !== CURRENT_RUN) {
+      // تشغيل جديد ظهر — انتقل إليه تلقائياً (loadEvents ستُجلب عبر showRun).
+      scheduleFollow(RUNS[0].id);
+    } else {
+      await loadEvents();
+    }
     if (!WS || WS.readyState > 1) connectWS();
   } catch (e) {
     setBadge("✖ تعذّر الاتصال", false);
@@ -234,6 +291,7 @@ async function demoActivity() {
   } catch (e) { /* تجاهل */ }
 }
 
+updateFollowBtn();
 refreshAll();
 setInterval(loadEvents, 4000);      // Poll: يلتقط أحداث الوكيل الخارجي (عملية منفصلة).
 setInterval(refreshAll, 15000);     // تحديث شامل دوري.
